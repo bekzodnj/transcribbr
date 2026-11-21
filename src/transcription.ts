@@ -3,7 +3,8 @@ import { Buffer } from 'node:buffer';
 import { MAX_BYTES, MAX_DURATION, splitTranscript } from './audio';
 import type { BotEnv, Job } from './types';
 import { safeError } from './logging';
-import { accountForLongerAudio, DAILY_LIMIT_MESSAGE, hasDailyCapacity, reserveInference } from './quota';
+import { accountForLongerAudio, hasDailyCapacity, reserveInference } from './quota';
+import { text as localizedText } from './messages';
 
 interface Progress { status: string; transcript: string | null; next_chunk: number }
 class PermanentError extends Error {}
@@ -11,18 +12,18 @@ class PermanentError extends Error {}
 async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: string) => void): Promise<string> {
 	setStage('quota.preflight');
 	if (job.duration !== undefined && (!Number.isFinite(job.duration) || job.duration < 0 || job.duration > MAX_DURATION)) {
-		throw new PermanentError('Audio exceeds the 10-minute limit or has invalid duration metadata.');
+		throw new PermanentError(localizedText(job.locale, 'tooLong'));
 	}
-	if (!await hasDailyCapacity(env, job)) throw new PermanentError(DAILY_LIMIT_MESSAGE);
+	if (!await hasDailyCapacity(env, job)) throw new PermanentError(localizedText(job.locale, 'dailyLimit'));
 	setStage('telegram.getFile');
 	const file = await api.getFile(job.fileId).catch((error: unknown) => {
 		if (error instanceof GrammyError && error.error_code === 400) {
-			throw new PermanentError('Audio is unavailable or too large. Please send a recording under 20 MB again.');
+			throw new PermanentError(localizedText(job.locale, 'unavailable'));
 		}
 		throw error;
 	});
-	if ((file.file_size ?? 0) > MAX_BYTES) throw new PermanentError('Audio exceeds the 20 MB limit.');
-	if (!file.file_path) throw new PermanentError('Audio is unavailable. Please send it again.');
+	if ((file.file_size ?? 0) > MAX_BYTES) throw new PermanentError(localizedText(job.locale, 'tooLarge'));
+	if (!file.file_path) throw new PermanentError(localizedText(job.locale, 'unavailable'));
 	setStage('telegram.download');
 	const response = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${file.file_path}`, {
 		signal: AbortSignal.timeout(60_000),
@@ -37,30 +38,39 @@ async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: str
 	const bounded = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
 		transform(chunk, controller) {
 			size += chunk.byteLength;
-			if (size > MAX_BYTES) throw new PermanentError('Audio exceeds the 20 MB limit.');
+			if (size > MAX_BYTES) throw new PermanentError(localizedText(job.locale, 'tooLarge'));
 			controller.enqueue(chunk);
 		},
 	}));
 	const data = await new Response(bounded).arrayBuffer();
-	if (!size) throw new PermanentError('The audio file is empty.');
+	if (!size) throw new PermanentError(localizedText(job.locale, 'empty'));
 	const audio = Buffer.from(data).toString('base64');
 	setStage('quota.reserve');
 	const inferenceDay = new Date();
-	if (!await reserveInference(env, job, inferenceDay)) throw new PermanentError(DAILY_LIMIT_MESSAGE);
+	if (!await reserveInference(env, job, inferenceDay)) throw new PermanentError(localizedText(job.locale, 'dailyLimit'));
 	setStage('whisper.inference');
+	const uzbekTest = env.WHISPER_UZBEK_TEST === 'true';
+	if (uzbekTest) console.info('Whisper Uzbek experiment enabled', { jobId: job.id, language: 'uz', beamSize: 8 });
 	const result = await env.AI.run('@cf/openai/whisper-large-v3-turbo', {
 		// Use the documented JSON-compatible input. An ArrayBuffer nested in an
 		// object does not serialize to audio bytes when sent to the inference API.
 		audio,
 		task: 'transcribe', vad_filter: true, condition_on_previous_text: false,
+		...(uzbekTest ? {
+			language: 'uz',
+			// A short context/spelling sample, not an instruction-following prompt.
+			// Keep this modest: examples can bias Whisper toward unspoken words.
+			initial_prompt: "O'zbek tilidagi kundalik suhbat, lotin yozuvida. Assalomu alaykum, yaxshimisiz? Bugun ishlar qanday? Rahmat, yaxshi, bo'ladi. O'zbekiston.",
+			beam_size: 8,
+		} : job.audioLanguage === 'en' || job.audioLanguage === 'uz' ? { language: job.audioLanguage } : {}),
 	});
 	setStage('whisper.response');
 	if (typeof result?.text !== 'string') throw new Error('Whisper response did not contain a text field');
 	await accountForLongerAudio(env, job, result.transcription_info?.duration, inferenceDay);
 	if ((result.transcription_info?.duration ?? 0) > MAX_DURATION) {
-		throw new PermanentError('Audio exceeds the 10-minute limit.');
+		throw new PermanentError(localizedText(job.locale, 'tooLong'));
 	}
-	return result.text.trim() || 'No speech could be detected in this recording.';
+	return result.text.trim() || localizedText(job.locale, 'noSpeech');
 }
 
 export async function consume(batch: MessageBatch<Job>, env: BotEnv) {
@@ -86,7 +96,7 @@ export async function consume(batch: MessageBatch<Job>, env: BotEnv) {
 				if (!row) throw new Error('Missing job');
 				let text = row.transcript;
 				if (batch.queue.endsWith('-dlq')) {
-					text = 'Sorry, I could not process this recording after several attempts. Please send it again later.';
+					text = localizedText(job.locale, 'processingError');
 				} else if (text === null) {
 					try {
 						text = await transcribe(env, api, job, (value) => { stage = value; });

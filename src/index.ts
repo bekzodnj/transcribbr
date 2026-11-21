@@ -3,6 +3,7 @@ import { createBot } from './bot';
 import { submitJob } from './jobs';
 import { consume } from './transcription';
 import type { BotEnv, Job } from './types';
+import { preferenceStore } from './preferences';
 
 export default {
 	async fetch(request, env): Promise<Response> {
@@ -14,7 +15,7 @@ export default {
 		if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
 			return new Response('Unauthorized', { status: 401 });
 		}
-		const bot = createBot(env.BOT_TOKEN, env.BOT_INFO, (job) => submitJob(env, job));
+		const bot = createBot(env.BOT_TOKEN, env.BOT_INFO, (job) => submitJob(env, job), preferenceStore(env.DB));
 		try {
 			return await webhookCallback(bot, 'cloudflare-mod', { secretToken: env.WEBHOOK_SECRET })(request);
 		} catch {

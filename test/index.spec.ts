@@ -3,12 +3,15 @@ import { Api } from 'grammy';
 import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import migration from '../migrations/0001_jobs.sql?raw';
 import quotaMigration from '../migrations/0002_global_usage.sql?raw';
+import preferencesMigration from '../migrations/0003_user_preferences.sql?raw';
 import worker from '../src/index';
 import { getAudio, splitTranscript } from '../src/audio';
 import { submitJob } from '../src/jobs';
 import { consume } from '../src/transcription';
 import { safeError } from '../src/logging';
 import { DAILY_LIMIT_MESSAGE, reserveInference } from '../src/quota';
+import { preferenceStore } from '../src/preferences';
+import { text } from '../src/messages';
 import type { BotEnv, Job } from '../src/types';
 import type { Message as TelegramMessage } from 'grammy/types';
 
@@ -16,7 +19,7 @@ const job: Job = { id: 1, userId: 2, chatId: 2, messageId: 3, fileId: 'voice-fil
 const db = (env as unknown as BotEnv).DB;
 const send = vi.fn().mockResolvedValue(undefined);
 const run = vi.fn().mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
-const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret',
+const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret', WHISPER_UZBEK_TEST: 'false',
 	TRANSCRIPTIONS: { send }, AI: { run } } as unknown as BotEnv;
 
 function batch(queue = 'transcribbr-transcriptions') {
@@ -25,11 +28,12 @@ function batch(queue = 'transcribbr-transcriptions') {
 }
 
 beforeAll(async () => {
-	for (const sql of (migration + quotaMigration).split(';').filter((sql) => sql.trim())) await db.prepare(sql).run();
+	for (const sql of (migration + quotaMigration + preferencesMigration).split(';').filter((sql) => sql.trim())) await db.prepare(sql).run();
 });
 beforeEach(async () => {
 	await db.prepare('DELETE FROM jobs').run();
 	await db.prepare('DELETE FROM daily_ai_usage').run();
+	await db.prepare('DELETE FROM user_preferences').run();
 	send.mockClear();
 	run.mockClear();
 	run.mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
@@ -38,6 +42,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('webhook', () => {
 	it('accepts an authenticated forwarded voice update without running inference in the webhook', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
 		const update = {
 			update_id: 1,
 			message: { message_id: 3, date: 1, chat: { id: 2, type: 'private', first_name: 'Test' },
@@ -45,13 +50,17 @@ describe('webhook', () => {
 				forward_origin: { type: 'hidden_user', sender_user_name: 'Sender', date: 1 },
 				voice: { file_id: 'voice-file', file_unique_id: 'unique', duration: 2, mime_type: 'audio/ogg' } },
 		};
-		const response = await worker.fetch(new Request('https://bot/webhook', {
+		const request = new Request<unknown, IncomingRequestCfProperties>('https://bot/webhook', {
 			method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': 'test-secret' },
 			body: JSON.stringify(update),
-		}), bindings);
+		});
+		const response = await worker.fetch(request.clone(), bindings);
 		expect(response.status).toBe(200);
-		expect(send).toHaveBeenCalledWith({ ...job, duration: 2 });
+		expect(send).toHaveBeenCalledWith({ ...job, duration: 2, locale: 'en', audioLanguage: 'auto' });
+		expect(reply).toHaveBeenCalledWith(job.chatId, text('en', 'received'), expect.anything(), undefined);
 		expect(run).not.toHaveBeenCalled();
+		await worker.fetch(request.clone(), bindings);
+		expect(reply).toHaveBeenCalledTimes(1);
 	});
 	it('has a health endpoint and rejects unauthenticated updates', async () => {
 		expect((await worker.fetch(new Request('https://bot/health'), bindings)).status).toBe(200);
@@ -81,11 +90,11 @@ describe('job admission', () => {
 	it('repairs enqueue failures on webhook retry and deduplicates completed jobs', async () => {
 		send.mockRejectedValueOnce(new Error('queue unavailable'));
 		await expect(submitJob(bindings, job)).rejects.toThrow();
-		expect(await submitJob(bindings, job)).toBe(true);
+		expect(await submitJob(bindings, job)).toBe('duplicate');
 		expect(await db.prepare('SELECT COUNT(*) AS count FROM jobs').first('count')).toBe(1);
 		await db.prepare("UPDATE jobs SET status = 'done'").run();
 		send.mockClear();
-		expect(await submitJob(bindings, job)).toBe(true);
+		expect(await submitJob(bindings, job)).toBe('duplicate');
 		expect(send).not.toHaveBeenCalled();
 	});
 	it('limits each user to five jobs per minute', async () => {
@@ -178,7 +187,7 @@ describe('consumer', () => {
 		const reply = mockTelegram();
 		await submitJob(bindings, job);
 		await consume(batch('transcribbr-transcriptions-dlq'), bindings);
-		expect(reply).toHaveBeenCalledWith(2, expect.stringContaining('several attempts'), expect.anything());
+		expect(reply).toHaveBeenCalledWith(2, text('en', 'processingError'), expect.anything());
 		expect(await db.prepare('SELECT status FROM jobs').first('status')).toBe('failed');
 		expect(run).not.toHaveBeenCalled();
 	});
@@ -259,5 +268,87 @@ describe('global AI quota', () => {
 			expect(await submitJob(bindings, { ...job, id, userId: id })).toBe(true);
 		}
 		expect(await submitJob(bindings, { ...job, id: 51, userId: 51 })).toBe(false);
+	});
+});
+
+describe('friendly onboarding and language preferences', () => {
+	async function sendText(value: string, updateId = 10, userId = 2) {
+		const response = await worker.fetch(new Request('https://bot/webhook', {
+			method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': 'test-secret' },
+			body: JSON.stringify({ update_id: updateId, message: {
+				message_id: updateId, date: 1, chat: { id: userId, type: 'private', first_name: 'Test' },
+				from: { id: userId, is_bot: false, first_name: 'Test' }, text: value,
+				...(value.startsWith('/') ? { entities: [{ type: 'bot_command', offset: 0, length: value.length }] } : {}),
+			} }),
+		}), bindings);
+		expect(response.status).toBe(200);
+	}
+	it('welcomes users with a built-in reply keyboard', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		await sendText('/start');
+		expect(reply.mock.calls[0][1]).toBe(text('en', 'welcome'));
+		expect(reply.mock.calls[0][2]).toMatchObject({
+			reply_markup: { keyboard: [[{ text: '🇺🇿 O‘zbekcha' }, { text: '🇬🇧 English' }]], resize_keyboard: true },
+		});
+		expect(send).not.toHaveBeenCalled();
+	});
+	it('persists UI language independently from recording language across webhook invocations', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		await sendText('🇺🇿 O‘zbekcha');
+		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'auto' });
+		expect(reply.mock.calls.map((call) => call[1])).toEqual([text('uz', 'ready'), text('uz', 'chooseAudio')]);
+		await sendText('🎙 Inglizcha', 11);
+		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'en' });
+		await sendText('/language', 12);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'chooseLanguage'));
+		await sendText('🌐 Avtomatik', 13);
+		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'auto' });
+		expect(await preferenceStore(db).get(99)).toEqual({ locale: 'en', audioLanguage: 'auto' });
+	});
+	it('shows helpful, localized instructions and privacy details', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		await preferenceStore(db).setLocale(2, 'uz');
+		await sendText('hello');
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'unsupported'));
+		await sendText('/privacy', 11);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'privacy'));
+	});
+	it('passes the recording language to Whisper, and localizes empty-speech feedback', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		vi.spyOn(Api.prototype, 'getFile').mockResolvedValue({ file_id: 'v', file_unique_id: 'u', file_path: 'voice/note.oga' });
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([79, 103, 103, 83]))));
+		run.mockResolvedValueOnce({ text: '' });
+		const localizedJob: Job = { ...job, locale: 'uz', audioLanguage: 'en' };
+		await submitJob(bindings, localizedJob);
+		const delivery = batch();
+		delivery.messages[0].body = localizedJob;
+		await consume(delivery, bindings);
+		expect(run).toHaveBeenCalledWith('@cf/openai/whisper-large-v3-turbo', expect.objectContaining({ language: 'en', task: 'transcribe' }));
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'noSpeech'));
+	});
+	it('temporarily forces Uzbek with a prompt and beam size without changing saved preferences', async () => {
+		await preferenceStore(db).setAudioLanguage(2, 'en');
+		vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		vi.spyOn(Api.prototype, 'getFile').mockResolvedValue({ file_id: 'v', file_unique_id: 'u', file_path: 'voice/note.oga' });
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([79, 103, 103, 83]))));
+		const delivery = batch();
+		delivery.messages[0].body = { ...job, audioLanguage: 'en' };
+		await submitJob(bindings, delivery.messages[0].body);
+		await consume(delivery, { ...bindings, WHISPER_UZBEK_TEST: 'true' });
+		expect(run).toHaveBeenCalledWith('@cf/openai/whisper-large-v3-turbo', expect.objectContaining({
+			language: 'uz', task: 'transcribe', beam_size: 8,
+			initial_prompt: expect.stringContaining("O'zbek tilidagi"),
+		}));
+		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'en', audioLanguage: 'en' });
+	});
+	it('localizes shared-quota messages for queued jobs', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		const localizedJob: Job = { ...job, locale: 'uz' };
+		await submitJob(bindings, localizedJob);
+		const delivery = batch();
+		delivery.messages[0].body = localizedJob;
+		await consume(delivery, { ...bindings, GLOBAL_DAILY_AI_CALLS: '0' });
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'dailyLimit'));
+		expect(run).not.toHaveBeenCalled();
 	});
 });

@@ -51,6 +51,9 @@
 		]
 	},
 	"vars": {
+		// TEMPORARY experiment: overrides ALL users' recording languages with Uzbek,
+		// a Latin-script context prompt, and beam_size 8. Set "false" and redeploy to revert.
+		"WHISPER_UZBEK_TEST": "false",
 		// Bot-wide UTC-day caps, including inference retries. Zero disables new inference.
 		// Audio minutes are estimated from Telegram metadata; unknown duration reserves 10 minutes.
 		"GLOBAL_DAILY_AUDIO_MINUTES": "180",

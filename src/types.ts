@@ -1,4 +1,5 @@
 import type { UserFromGetMe } from 'grammy/types';
+import type { AudioLanguage, Locale } from './messages';
 
 export interface Job {
 	id: number;
@@ -8,6 +9,8 @@ export interface Job {
 	fileId: string;
 	mimeType: string;
 	duration?: number;
+	locale?: Locale;
+	audioLanguage?: AudioLanguage;
 }
 
 export interface BotEnv {
@@ -19,4 +22,5 @@ export interface BotEnv {
 	TRANSCRIPTIONS: Queue<Job>;
 	GLOBAL_DAILY_AUDIO_MINUTES?: string;
 	GLOBAL_DAILY_AI_CALLS?: string;
+	WHISPER_UZBEK_TEST?: string;
 }

@@ -1,7 +1,8 @@
 import { MAX_DURATION } from './audio';
 import type { BotEnv, Job } from './types';
+import { text } from './messages';
 
-export const DAILY_LIMIT_MESSAGE = 'The bot has reached its shared daily transcription limit. Please try again after 00:00 UTC.';
+export const DAILY_LIMIT_MESSAGE = text('en', 'dailyLimit');
 
 function limit(value: string | undefined, fallback: number): number {
 	if (value === undefined) return fallback;
