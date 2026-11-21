@@ -1,29 +1,193 @@
-import {
-	env,
-	createExecutionContext,
-	waitOnExecutionContext,
-	SELF,
-} from "cloudflare:test";
-import { describe, it, expect } from "vitest";
-import worker from "../src/index";
+import { env } from 'cloudflare:test';
+import { Api } from 'grammy';
+import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import migration from '../migrations/0001_jobs.sql?raw';
+import worker from '../src/index';
+import { getAudio, splitTranscript } from '../src/audio';
+import { submitJob } from '../src/jobs';
+import { consume } from '../src/transcription';
+import { safeError } from '../src/logging';
+import type { BotEnv, Job } from '../src/types';
+import type { Message as TelegramMessage } from 'grammy/types';
 
-// For now, you'll need to do something like this to get a correctly-typed
-// `Request` to pass to `worker.fetch()`.
-const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
+const job: Job = { id: 1, userId: 2, chatId: 2, messageId: 3, fileId: 'voice-file', mimeType: 'audio/ogg' };
+const db = (env as unknown as BotEnv).DB;
+const send = vi.fn().mockResolvedValue(undefined);
+const run = vi.fn().mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
+const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret',
+	TRANSCRIPTIONS: { send }, AI: { run } } as unknown as BotEnv;
 
-describe("Hello World worker", () => {
-	it("responds with Hello World! (unit style)", async () => {
-		const request = new IncomingRequest("http://example.com");
-		// Create an empty context to pass to `worker.fetch()`.
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		// Wait for all `Promise`s passed to `ctx.waitUntil()` to settle before running test assertions
-		await waitOnExecutionContext(ctx);
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+function batch(queue = 'transcribbr-transcriptions') {
+	const message = { body: job, id: 'queue-id', attempts: 1, timestamp: new Date(), ack: vi.fn(), retry: vi.fn() };
+	return { queue, messages: [message], metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } }, ackAll: vi.fn(), retryAll: vi.fn() };
+}
+
+beforeAll(async () => {
+	for (const sql of migration.split(';').filter((sql) => sql.trim())) await db.prepare(sql).run();
+});
+beforeEach(async () => {
+	await db.prepare('DELETE FROM jobs').run();
+	send.mockClear();
+	run.mockClear();
+	run.mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
+});
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+describe('webhook', () => {
+	it('accepts an authenticated forwarded voice update without running inference in the webhook', async () => {
+		const update = {
+			update_id: 1,
+			message: { message_id: 3, date: 1, chat: { id: 2, type: 'private', first_name: 'Test' },
+				from: { id: 2, is_bot: false, first_name: 'Test' },
+				forward_origin: { type: 'hidden_user', sender_user_name: 'Sender', date: 1 },
+				voice: { file_id: 'voice-file', file_unique_id: 'unique', duration: 2, mime_type: 'audio/ogg' } },
+		};
+		const response = await worker.fetch(new Request('https://bot/webhook', {
+			method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': 'test-secret' },
+			body: JSON.stringify(update),
+		}), bindings);
+		expect(response.status).toBe(200);
+		expect(send).toHaveBeenCalledWith(job);
+		expect(run).not.toHaveBeenCalled();
 	});
+	it('has a health endpoint and rejects unauthenticated updates', async () => {
+		expect((await worker.fetch(new Request('https://bot/health'), bindings)).status).toBe(200);
+		expect((await worker.fetch(new Request('https://bot/webhook', { method: 'POST' }), bindings)).status).toBe(401);
+		expect((await worker.fetch(new Request('https://bot/webhook'), bindings)).status).toBe(405);
+		expect((await worker.fetch(new Request('https://bot/unknown'), bindings)).status).toBe(404);
+		expect(send).not.toHaveBeenCalled();
+	});
+});
 
-	it("responds with Hello World! (integration style)", async () => {
-		const response = await SELF.fetch("https://example.com");
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+describe('audio', () => {
+	it('recognizes voice, MP3 and audio documents, not arbitrary documents', () => {
+		expect(getAudio({ voice: { file_id: 'v', duration: 2 } } as TelegramMessage)?.mimeType).toBe('audio/ogg');
+		expect(getAudio({ audio: { file_id: 'a', mime_type: 'audio/mpeg' } } as TelegramMessage)?.fileId).toBe('a');
+		expect(getAudio({ document: { file_id: 'd', file_name: 'note.OGG' } } as TelegramMessage)?.mimeType).toBe('audio/ogg');
+		expect(getAudio({ document: { file_id: 'd', file_name: 'report.pdf' } } as TelegramMessage)).toBeUndefined();
+	});
+	it('splits long transcripts without breaking emoji', () => {
+		const text = 'a'.repeat(3999) + '😀' + 'b'.repeat(5000);
+		const chunks = splitTranscript(text);
+		expect(chunks.join('')).toBe(text);
+		expect(chunks.every((chunk) => chunk.length <= 4000 && chunk.isWellFormed())).toBe(true);
+	});
+});
+
+describe('job admission', () => {
+	it('repairs enqueue failures on webhook retry and deduplicates completed jobs', async () => {
+		send.mockRejectedValueOnce(new Error('queue unavailable'));
+		await expect(submitJob(bindings, job)).rejects.toThrow();
+		expect(await submitJob(bindings, job)).toBe(true);
+		expect(await db.prepare('SELECT COUNT(*) AS count FROM jobs').first('count')).toBe(1);
+		await db.prepare("UPDATE jobs SET status = 'done'").run();
+		send.mockClear();
+		expect(await submitJob(bindings, job)).toBe(true);
+		expect(send).not.toHaveBeenCalled();
+	});
+	it('limits each user to five jobs per minute', async () => {
+		for (let id = 1; id <= 5; id++) expect(await submitJob(bindings, { ...job, id })).toBe(true);
+		expect(await submitJob(bindings, { ...job, id: 6 })).toBe(false);
+		expect(await submitJob(bindings, { ...job, id: 7, userId: 99 })).toBe(true);
+	});
+});
+
+describe('consumer', () => {
+	function mockTelegram() {
+		vi.spyOn(Api.prototype, 'getFile').mockResolvedValue({ file_id: 'v', file_unique_id: 'u', file_path: 'voice/note.oga', file_size: 4 });
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(new Uint8Array([79, 103, 103, 83]))));
+		return reply;
+	}
+	it('transcribes, replies, clears temporary text, and skips duplicate delivery', async () => {
+		const reply = mockTelegram();
+		await submitJob(bindings, job);
+		const first = batch();
+		await consume(first, bindings);
+		expect(first.messages[0].ack).toHaveBeenCalled();
+		expect(run).toHaveBeenCalledWith('@cf/openai/whisper-large-v3-turbo', {
+			audio: 'T2dnUw==', task: 'transcribe', vad_filter: true, condition_on_previous_text: false,
+		});
+		expect(reply).toHaveBeenCalledWith(2, 'Salom! Hello!', expect.anything());
+		expect(await db.prepare('SELECT status, transcript FROM jobs').first()).toMatchObject({ status: 'done', transcript: null });
+		await consume(batch(), bindings);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(reply).toHaveBeenCalledTimes(1);
+	});
+	it('retries delivery without retranscribing', async () => {
+		const reply = mockTelegram();
+		reply.mockRejectedValueOnce(new Error('network unavailable'));
+		await submitJob(bindings, job);
+		const first = batch();
+		await consume(first, bindings);
+		expect(first.messages[0].retry).toHaveBeenCalled();
+		await consume(batch(), bindings);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(reply).toHaveBeenCalledTimes(2);
+	});
+	it('resumes at the next unsent chunk after a partial reply failure', async () => {
+		const reply = mockTelegram();
+		run.mockResolvedValueOnce({ text: 'a'.repeat(5000) });
+		reply.mockResolvedValueOnce({ message_id: 9 } as TelegramMessage.TextMessage)
+			.mockRejectedValueOnce(new Error('network unavailable'));
+		await submitJob(bindings, job);
+		await consume(batch(), bindings);
+		expect(await db.prepare('SELECT next_chunk FROM jobs').first('next_chunk')).toBe(1);
+		await consume(batch(), bindings);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(reply.mock.calls.map((call) => call[1].length)).toEqual([4000, 1000, 1000]);
+	});
+	it('rejects oversized metadata before downloading or running inference', async () => {
+		const reply = mockTelegram();
+		vi.mocked(Api.prototype.getFile).mockResolvedValueOnce({ file_id: 'v', file_unique_id: 'u', file_size: 20_000_001 });
+		await submitJob(bindings, job);
+		await consume(batch(), bindings);
+		expect(reply).toHaveBeenCalledWith(2, expect.stringContaining('20 MB'), expect.anything());
+		expect(fetch).not.toHaveBeenCalled();
+		expect(run).not.toHaveBeenCalled();
+	});
+	it('retries temporary inference failures and releases the lease', async () => {
+		mockTelegram();
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		run.mockRejectedValueOnce(new Error('inference unavailable'));
+		await submitJob(bindings, job);
+		const delivery = batch();
+		await consume(delivery, bindings);
+		expect(log).toHaveBeenCalledWith('Transcription job failed', expect.objectContaining({
+			stage: 'whisper.inference', errorMessage: 'inference unavailable',
+		}));
+		expect(delivery.messages[0].retry).toHaveBeenCalled();
+		expect(await db.prepare('SELECT lease_until FROM jobs').first('lease_until')).toBe(0);
+		await consume(batch(), bindings);
+		expect(run).toHaveBeenCalledTimes(2);
+	});
+	it('does not steal active leases', async () => {
+		await submitJob(bindings, job);
+		await db.prepare('UPDATE jobs SET lease_until = ?1').bind(Date.now() + 60000).run();
+		const delivery = batch();
+		await consume(delivery, bindings);
+		expect(delivery.messages[0].retry).toHaveBeenCalled();
+		expect(run).not.toHaveBeenCalled();
+	});
+	it('notifies users when retries reach the dead-letter queue', async () => {
+		const reply = mockTelegram();
+		await submitJob(bindings, job);
+		await consume(batch('transcribbr-transcriptions-dlq'), bindings);
+		expect(reply).toHaveBeenCalledWith(2, expect.stringContaining('several attempts'), expect.anything());
+		expect(await db.prepare('SELECT status FROM jobs').first('status')).toBe('failed');
+		expect(run).not.toHaveBeenCalled();
+	});
+});
+
+describe('safe diagnostics', () => {
+	it('redacts secrets, URLs and large payloads without logging raw errors', () => {
+		const error = new Error(`Failure secret-value https://api.telegram.org/file/bot123:abc/voice.oga 456:def ${'A'.repeat(100)}`);
+		const result = safeError(error, ['secret-value']);
+		expect(result.errorMessage).toContain('Failure');
+		expect(result.errorMessage).not.toContain('secret-value');
+		expect(result.errorMessage).not.toContain('api.telegram.org');
+		expect(result.errorMessage).not.toContain('456:def');
+		expect(result.errorMessage).not.toContain('A'.repeat(100));
+		expect(result).not.toHaveProperty('stack');
 	});
 });

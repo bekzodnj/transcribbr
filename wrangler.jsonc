@@ -11,8 +11,47 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	"ai": {
+		"binding": "AI"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "transcribbr-jobs",
+			"database_id": "5422e9d3-422a-406c-851b-377ba9aff7d6",
+			"migrations_dir": "migrations"
+		}
+	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "TRANSCRIPTIONS",
+				"queue": "transcribbr-transcriptions"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "transcribbr-transcriptions",
+				"max_batch_size": 1,
+				"max_batch_timeout": 1,
+				"max_retries": 3,
+				"dead_letter_queue": "transcribbr-transcriptions-dlq",
+				"max_concurrency": 2
+			},
+			{
+				"queue": "transcribbr-transcriptions-dlq",
+				"max_batch_size": 1,
+				"max_retries": 3
+			}
+		]
+	},
+	"triggers": {
+		"crons": [
+			"0 * * * *"
+		]
+	},
 	"vars": {
-		"BOT_INFO" : {
+		"BOT_INFO": {
 			"id": 8802381338,
 			"is_bot": true,
 			"first_name": "Transcribe bot",
@@ -27,7 +66,7 @@
 			"allows_users_to_create_topics": false,
 			"can_manage_bots": false,
 			"supports_join_request_queries": false
-  		}
+		}
 	}
 	/**
 	 * Smart Placement

@@ -1,43 +1,35 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
-import { Bot, Context, webhookCallback } from 'grammy';
-import type { UserFromGetMe } from 'grammy/types';
+import { webhookCallback } from 'grammy';
 import { createBot } from './bot';
-
-export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
-	BOT_INFO: UserFromGetMe;
-	BOT_TOKEN: string;
-}
+import { submitJob } from './jobs';
+import { consume } from './transcription';
+import type { BotEnv, Job } from './types';
 
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const bot = createBot(env.BOT_TOKEN, env.BOT_INFO);
-
-		return webhookCallback(bot, 'cloudflare-mod')(request);
+	async fetch(request, env): Promise<Response> {
+		const path = new URL(request.url).pathname;
+		if (path === '/health' && request.method === 'GET') return new Response('OK');
+		if (path !== '/webhook') return new Response('Not found', { status: 404 });
+		if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+		if (!env.WEBHOOK_SECRET) return new Response('Webhook not configured', { status: 503 });
+		if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
+			return new Response('Unauthorized', { status: 401 });
+		}
+		const bot = createBot(env.BOT_TOKEN, env.BOT_INFO, (job) => submitJob(env, job));
+		try {
+			return await webhookCallback(bot, 'cloudflare-mod', { secretToken: env.WEBHOOK_SECRET })(request);
+		} catch {
+			// Do not log raw errors: request URLs can include the Telegram bot token.
+			console.error('Webhook processing failed');
+			return new Response('Please retry', { status: 503 });
+		}
 	},
-} satisfies ExportedHandler<Env>;
+	async queue(batch, env) {
+		await consume(batch, env);
+	},
+	async scheduled(_event, env) {
+		await env.DB.batch([
+			env.DB.prepare('UPDATE jobs SET transcript = NULL WHERE created_at < ?1').bind(Date.now() - 86_400_000),
+			env.DB.prepare('DELETE FROM jobs WHERE created_at < ?1').bind(Date.now() - 7 * 86_400_000),
+		]);
+	},
+} satisfies ExportedHandler<BotEnv, Job>;

@@ -1,17 +1,35 @@
-import { Bot, Context } from 'grammy';
+import { Bot } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
+import { getAudio, MAX_BYTES, MAX_DURATION } from './audio';
+import type { Job } from './types';
 
-export function createBot(token: string, botInfo?: UserFromGetMe) {
+export function createBot(token: string, botInfo?: UserFromGetMe, submit?: (job: Job) => Promise<boolean>) {
 	const bot = new Bot(token, { botInfo });
 
-	bot.command('start', async (ctx: Context) => {
-		await ctx.reply('Hello! I am your friendly bot. How can I assist you today?');
+	bot.command('start', async (ctx) => {
+		await ctx.reply('Send or forward a voice note or audio file (up to 10 minutes / 20 MB). I transcribe it using Cloudflare Workers AI. Audio is not stored by this app; temporary transcripts are deleted after delivery or after about one day.');
 	});
-	bot.hears(/hello/i, async (ctx: Context) => {
-		await ctx.reply('Hello there! How can I help you?');
-	});
-	bot.on('message', async (ctx: Context) => {
-		await ctx.reply('I received your message!');
+
+	bot.on('message', async (ctx) => {
+		if (ctx.chat.type !== 'private') return;
+		const audio = getAudio(ctx.msg);
+		if (!audio) {
+			await ctx.reply('Please send a voice note or an OGG, MP3, M4A, WAV, FLAC, or WebM audio file.');
+			return;
+		}
+		if ((audio.fileSize ?? 0) > MAX_BYTES || (audio.duration ?? 0) > MAX_DURATION) {
+			await ctx.reply('Please send audio no larger than 20 MB and no longer than 10 minutes.');
+			return;
+		}
+		if (!submit) {
+			await ctx.reply('Transcription requires the Cloudflare Worker. Run npm run dev and connect a development webhook.');
+			return;
+		}
+		const accepted = await submit({
+			id: ctx.update.update_id, chatId: ctx.chat.id, messageId: ctx.msg.message_id,
+			userId: ctx.from.id, fileId: audio.fileId, mimeType: audio.mimeType,
+		});
+		if (!accepted) await ctx.reply('Too many recordings. Please wait a minute before sending another.');
 	});
 
 	return bot;
