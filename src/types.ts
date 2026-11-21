@@ -7,6 +7,7 @@ export interface Job {
 	userId: number;
 	fileId: string;
 	mimeType: string;
+	duration?: number;
 }
 
 export interface BotEnv {
@@ -16,4 +17,6 @@ export interface BotEnv {
 	AI: Ai;
 	DB: D1Database;
 	TRANSCRIPTIONS: Queue<Job>;
+	GLOBAL_DAILY_AUDIO_MINUTES?: string;
+	GLOBAL_DAILY_AI_CALLS?: string;
 }

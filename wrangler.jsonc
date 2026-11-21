@@ -51,6 +51,10 @@
 		]
 	},
 	"vars": {
+		// Bot-wide UTC-day caps, including inference retries. Zero disables new inference.
+		// Audio minutes are estimated from Telegram metadata; unknown duration reserves 10 minutes.
+		"GLOBAL_DAILY_AUDIO_MINUTES": "180",
+		"GLOBAL_DAILY_AI_CALLS": "500",
 		"BOT_INFO": {
 			"id": 8802381338,
 			"is_bot": true,

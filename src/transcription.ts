@@ -3,11 +3,17 @@ import { Buffer } from 'node:buffer';
 import { MAX_BYTES, MAX_DURATION, splitTranscript } from './audio';
 import type { BotEnv, Job } from './types';
 import { safeError } from './logging';
+import { accountForLongerAudio, DAILY_LIMIT_MESSAGE, hasDailyCapacity, reserveInference } from './quota';
 
 interface Progress { status: string; transcript: string | null; next_chunk: number }
 class PermanentError extends Error {}
 
 async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: string) => void): Promise<string> {
+	setStage('quota.preflight');
+	if (job.duration !== undefined && (!Number.isFinite(job.duration) || job.duration < 0 || job.duration > MAX_DURATION)) {
+		throw new PermanentError('Audio exceeds the 10-minute limit or has invalid duration metadata.');
+	}
+	if (!await hasDailyCapacity(env, job)) throw new PermanentError(DAILY_LIMIT_MESSAGE);
 	setStage('telegram.getFile');
 	const file = await api.getFile(job.fileId).catch((error: unknown) => {
 		if (error instanceof GrammyError && error.error_code === 400) {
@@ -37,15 +43,20 @@ async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: str
 	}));
 	const data = await new Response(bounded).arrayBuffer();
 	if (!size) throw new PermanentError('The audio file is empty.');
+	const audio = Buffer.from(data).toString('base64');
+	setStage('quota.reserve');
+	const inferenceDay = new Date();
+	if (!await reserveInference(env, job, inferenceDay)) throw new PermanentError(DAILY_LIMIT_MESSAGE);
 	setStage('whisper.inference');
 	const result = await env.AI.run('@cf/openai/whisper-large-v3-turbo', {
 		// Use the documented JSON-compatible input. An ArrayBuffer nested in an
 		// object does not serialize to audio bytes when sent to the inference API.
-		audio: Buffer.from(data).toString('base64'),
+		audio,
 		task: 'transcribe', vad_filter: true, condition_on_previous_text: false,
 	});
 	setStage('whisper.response');
 	if (typeof result?.text !== 'string') throw new Error('Whisper response did not contain a text field');
+	await accountForLongerAudio(env, job, result.transcription_info?.duration, inferenceDay);
 	if ((result.transcription_info?.duration ?? 0) > MAX_DURATION) {
 		throw new PermanentError('Audio exceeds the 10-minute limit.');
 	}

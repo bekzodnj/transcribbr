@@ -2,11 +2,13 @@ import { env } from 'cloudflare:test';
 import { Api } from 'grammy';
 import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import migration from '../migrations/0001_jobs.sql?raw';
+import quotaMigration from '../migrations/0002_global_usage.sql?raw';
 import worker from '../src/index';
 import { getAudio, splitTranscript } from '../src/audio';
 import { submitJob } from '../src/jobs';
 import { consume } from '../src/transcription';
 import { safeError } from '../src/logging';
+import { DAILY_LIMIT_MESSAGE, reserveInference } from '../src/quota';
 import type { BotEnv, Job } from '../src/types';
 import type { Message as TelegramMessage } from 'grammy/types';
 
@@ -23,10 +25,11 @@ function batch(queue = 'transcribbr-transcriptions') {
 }
 
 beforeAll(async () => {
-	for (const sql of migration.split(';').filter((sql) => sql.trim())) await db.prepare(sql).run();
+	for (const sql of (migration + quotaMigration).split(';').filter((sql) => sql.trim())) await db.prepare(sql).run();
 });
 beforeEach(async () => {
 	await db.prepare('DELETE FROM jobs').run();
+	await db.prepare('DELETE FROM daily_ai_usage').run();
 	send.mockClear();
 	run.mockClear();
 	run.mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
@@ -47,7 +50,7 @@ describe('webhook', () => {
 			body: JSON.stringify(update),
 		}), bindings);
 		expect(response.status).toBe(200);
-		expect(send).toHaveBeenCalledWith(job);
+		expect(send).toHaveBeenCalledWith({ ...job, duration: 2 });
 		expect(run).not.toHaveBeenCalled();
 	});
 	it('has a health endpoint and rejects unauthenticated updates', async () => {
@@ -124,6 +127,7 @@ describe('consumer', () => {
 		await consume(batch(), bindings);
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(reply).toHaveBeenCalledTimes(2);
+		expect(await db.prepare('SELECT inference_calls FROM daily_ai_usage').first('inference_calls')).toBe(1);
 	});
 	it('resumes at the next unsent chunk after a partial reply failure', async () => {
 		const reply = mockTelegram();
@@ -160,6 +164,7 @@ describe('consumer', () => {
 		expect(await db.prepare('SELECT lease_until FROM jobs').first('lease_until')).toBe(0);
 		await consume(batch(), bindings);
 		expect(run).toHaveBeenCalledTimes(2);
+		expect(await db.prepare('SELECT inference_calls FROM daily_ai_usage').first('inference_calls')).toBe(2);
 	});
 	it('does not steal active leases', async () => {
 		await submitJob(bindings, job);
@@ -189,5 +194,70 @@ describe('safe diagnostics', () => {
 		expect(result.errorMessage).not.toContain('456:def');
 		expect(result.errorMessage).not.toContain('A'.repeat(100));
 		expect(result).not.toHaveProperty('stack');
+	});
+});
+
+describe('global AI quota', () => {
+	it('uses one shared budget across users and rejects concurrent overruns', async () => {
+		const capped = { ...bindings, GLOBAL_DAILY_AUDIO_MINUTES: '1', GLOBAL_DAILY_AI_CALLS: '500' };
+		const accepted = await Promise.all(Array.from({ length: 12 }, (_, index) =>
+			reserveInference(capped, { ...job, userId: index, duration: 20 })));
+		expect(accepted.filter(Boolean)).toHaveLength(3);
+		expect(await db.prepare('SELECT reserved_seconds, inference_calls FROM daily_ai_usage').first())
+			.toEqual({ reserved_seconds: 60, inference_calls: 3 });
+	});
+	it('enforces the call cap independently of audio minutes', async () => {
+		const capped = { ...bindings, GLOBAL_DAILY_AI_CALLS: '2' };
+		expect(await reserveInference(capped, { ...job, duration: 1 })).toBe(true);
+		expect(await reserveInference(capped, { ...job, duration: 1 })).toBe(true);
+		expect(await reserveInference(capped, { ...job, duration: 1 })).toBe(false);
+		expect(await db.prepare('SELECT reserved_seconds FROM daily_ai_usage').first('reserved_seconds')).toBe(20);
+	});
+	it('resets on UTC day boundaries without needing cron', async () => {
+		const capped = { ...bindings, GLOBAL_DAILY_AI_CALLS: '1' };
+		expect(await reserveInference(capped, job, new Date('2026-11-21T23:59:59Z'))).toBe(true);
+		expect(await reserveInference(capped, job, new Date('2026-11-21T23:59:59Z'))).toBe(false);
+		expect(await reserveInference(capped, job, new Date('2026-11-22T00:00:00Z'))).toBe(true);
+	});
+	it('reserves ten minutes for unknown durations and fails closed for bad configuration', async () => {
+		expect(await reserveInference(bindings, job)).toBe(true);
+		expect(await db.prepare('SELECT reserved_seconds FROM daily_ai_usage').first('reserved_seconds')).toBe(600);
+		await expect(reserveInference({ ...bindings, GLOBAL_DAILY_AI_CALLS: 'invalid' }, job)).rejects.toThrow();
+		expect(await reserveInference({ ...bindings, GLOBAL_DAILY_AUDIO_MINUTES: '0' }, job)).toBe(false);
+	});
+	it('rejects new jobs before queueing when the shared budget is exhausted', async () => {
+		const capped = { ...bindings, GLOBAL_DAILY_AI_CALLS: '0' };
+		expect(await submitJob(capped, job)).toBe(DAILY_LIMIT_MESSAGE);
+		expect(send).not.toHaveBeenCalled();
+		expect(await db.prepare('SELECT COUNT(*) FROM jobs').first('COUNT(*)')).toBe(0);
+	});
+	it('rechecks queued jobs and notifies without calling AI or downloading', async () => {
+		await submitJob(bindings, job);
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		const getFile = vi.spyOn(Api.prototype, 'getFile');
+		const delivery = batch();
+		await consume(delivery, { ...bindings, GLOBAL_DAILY_AI_CALLS: '0' });
+		expect(reply).toHaveBeenCalledWith(job.chatId, DAILY_LIMIT_MESSAGE, expect.anything());
+		expect(getFile).not.toHaveBeenCalled();
+		expect(run).not.toHaveBeenCalled();
+		expect(delivery.messages[0].ack).toHaveBeenCalled();
+	});
+	it('records duration underestimates reported by Whisper', async () => {
+		const timedJob = { ...job, duration: 10 };
+		await submitJob(bindings, timedJob);
+		vi.spyOn(Api.prototype, 'getFile').mockResolvedValue({ file_id: 'v', file_unique_id: 'u', file_path: 'voice/note.oga' });
+		vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([79, 103, 103, 83]))));
+		run.mockResolvedValueOnce({ text: 'Hello', transcription_info: { duration: 30 } });
+		const delivery = batch();
+		delivery.messages[0].body = timedJob;
+		await consume(delivery, bindings);
+		expect(await db.prepare('SELECT reserved_seconds FROM daily_ai_usage').first('reserved_seconds')).toBe(30);
+	});
+	it('limits the global pending backlog independently of user IDs', async () => {
+		for (let id = 1; id <= 50; id++) {
+			expect(await submitJob(bindings, { ...job, id, userId: id })).toBe(true);
+		}
+		expect(await submitJob(bindings, { ...job, id: 51, userId: 51 })).toBe(false);
 	});
 });

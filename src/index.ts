@@ -28,6 +28,7 @@ export default {
 	},
 	async scheduled(_event, env) {
 		await env.DB.batch([
+			env.DB.prepare('DELETE FROM daily_ai_usage WHERE day < ?1').bind(new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10)),
 			env.DB.prepare('UPDATE jobs SET transcript = NULL WHERE created_at < ?1').bind(Date.now() - 86_400_000),
 			env.DB.prepare('DELETE FROM jobs WHERE created_at < ?1').bind(Date.now() - 7 * 86_400_000),
 		]);

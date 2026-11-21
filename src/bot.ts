@@ -3,7 +3,7 @@ import type { UserFromGetMe } from 'grammy/types';
 import { getAudio, MAX_BYTES, MAX_DURATION } from './audio';
 import type { Job } from './types';
 
-export function createBot(token: string, botInfo?: UserFromGetMe, submit?: (job: Job) => Promise<boolean>) {
+export function createBot(token: string, botInfo?: UserFromGetMe, submit?: (job: Job) => Promise<boolean | string>) {
 	const bot = new Bot(token, { botInfo });
 
 	bot.command('start', async (ctx) => {
@@ -28,8 +28,9 @@ export function createBot(token: string, botInfo?: UserFromGetMe, submit?: (job:
 		const accepted = await submit({
 			id: ctx.update.update_id, chatId: ctx.chat.id, messageId: ctx.msg.message_id,
 			userId: ctx.from.id, fileId: audio.fileId, mimeType: audio.mimeType,
+			...(audio.duration === undefined ? {} : { duration: audio.duration }),
 		});
-		if (!accepted) await ctx.reply('Too many recordings. Please wait a minute before sending another.');
+		if (accepted !== true) await ctx.reply(typeof accepted === 'string' ? accepted : 'Too many recordings or the bot is busy. Please wait a minute before sending another.');
 	});
 
 	return bot;
