@@ -51,6 +51,10 @@
 		]
 	},
 	"vars": {
+		// TEMPORARY PoC for ALL users: audio goes to Google (free-tier data-use terms apply).
+		// Revert to the unchanged Whisper path: set "false" and redeploy.
+		// GEMINI_API_KEY must be a Worker secret, never a plaintext var here.
+		"GEMINI_TRANSCRIBE_TEST": "true",
 		// TEMPORARY experiment: overrides ALL users' recording languages with Uzbek,
 		// a Latin-script context prompt, and beam_size 8. Set "false" and redeploy to revert.
 		"WHISPER_UZBEK_TEST": "false",

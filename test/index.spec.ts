@@ -19,7 +19,7 @@ const job: Job = { id: 1, userId: 2, chatId: 2, messageId: 3, fileId: 'voice-fil
 const db = (env as unknown as BotEnv).DB;
 const send = vi.fn().mockResolvedValue(undefined);
 const run = vi.fn().mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
-const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret', WHISPER_UZBEK_TEST: 'false',
+const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret', WHISPER_UZBEK_TEST: 'false', GEMINI_TRANSCRIBE_TEST: 'false',
 	TRANSCRIPTIONS: { send }, AI: { run } } as unknown as BotEnv;
 
 function batch(queue = 'transcribbr-transcriptions') {
@@ -137,6 +137,50 @@ describe('consumer', () => {
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(reply).toHaveBeenCalledTimes(2);
 		expect(await db.prepare('SELECT inference_calls FROM daily_ai_usage').first('inference_calls')).toBe(1);
+	});
+	it('uses Gemini when enabled and retries delivery without another inference', async () => {
+		const reply = mockTelegram();
+		reply.mockRejectedValueOnce(new Error('delivery unavailable'));
+		vi.mocked(fetch).mockResolvedValueOnce(new Response(new Uint8Array([79, 103, 103, 83])))
+			.mockResolvedValueOnce(Response.json({ status: 'completed', steps: [
+				{ type: 'model_output', content: [{ type: 'text', text: ' Gemini transcript ' }] },
+			] }));
+		const testBindings = { ...bindings, GEMINI_TRANSCRIBE_TEST: 'true', GEMINI_API_KEY: 'test-gemini-key' };
+		await submitJob(testBindings, job);
+		const first = batch();
+		await consume(first, testBindings);
+		expect(first.messages[0].retry).toHaveBeenCalled();
+		await consume(batch(), testBindings);
+		expect(run).not.toHaveBeenCalled();
+		expect(fetch).toHaveBeenCalledTimes(2); // Telegram download + Google inference only.
+		expect(reply).toHaveBeenLastCalledWith(2, 'Gemini transcript', expect.anything());
+		expect(await db.prepare('SELECT inference_calls FROM daily_ai_usage').first('inference_calls')).toBe(1);
+	});
+	it('fails closed without a Gemini key before downloading or reserving inference', async () => {
+		mockTelegram();
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		await submitJob(bindings, job);
+		const delivery = batch();
+		await consume(delivery, { ...bindings, GEMINI_TRANSCRIBE_TEST: 'true', GEMINI_API_KEY: undefined });
+		expect(fetch).not.toHaveBeenCalled();
+		expect(run).not.toHaveBeenCalled();
+		expect(delivery.messages[0].retry).toHaveBeenCalled();
+		expect(await db.prepare('SELECT COUNT(*) AS count FROM daily_ai_usage').first('count')).toBe(0);
+	});
+	it('retries Gemini HTTP failures without invoking Whisper or logging private provider content', async () => {
+		const reply = mockTelegram();
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.mocked(fetch).mockResolvedValueOnce(new Response(new Uint8Array([79, 103, 103, 83])))
+			.mockResolvedValueOnce(new Response('test-gemini-key private transcript', { status: 429 }));
+		await submitJob(bindings, job);
+		const delivery = batch();
+		await consume(delivery, { ...bindings, GEMINI_TRANSCRIBE_TEST: 'true', GEMINI_API_KEY: 'test-gemini-key' });
+		expect(delivery.messages[0].retry).toHaveBeenCalled();
+		expect(run).not.toHaveBeenCalled();
+		expect(reply).not.toHaveBeenCalled();
+		expect(log).toHaveBeenCalledWith('Transcription job failed', expect.objectContaining({
+			stage: 'gemini.inference', errorMessage: 'Gemini transcription failed (HTTP 429)',
+		}));
 	});
 	it('resumes at the next unsent chunk after a partial reply failure', async () => {
 		const reply = mockTelegram();

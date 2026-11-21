@@ -23,4 +23,6 @@ export interface BotEnv {
 	GLOBAL_DAILY_AUDIO_MINUTES?: string;
 	GLOBAL_DAILY_AI_CALLS?: string;
 	WHISPER_UZBEK_TEST?: string;
+	GEMINI_TRANSCRIBE_TEST?: string;
+	GEMINI_API_KEY?: string;
 }

@@ -5,11 +5,14 @@ import type { BotEnv, Job } from './types';
 import { safeError } from './logging';
 import { accountForLongerAudio, hasDailyCapacity, reserveInference } from './quota';
 import { text as localizedText } from './messages';
+import { transcribeWithGemini } from './gemini';
 
 interface Progress { status: string; transcript: string | null; next_chunk: number }
 class PermanentError extends Error {}
 
 async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: string) => void): Promise<string> {
+	const geminiTest = env.GEMINI_TRANSCRIBE_TEST === 'true';
+	if (geminiTest && !env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is required for the Gemini experiment');
 	setStage('quota.preflight');
 	if (job.duration !== undefined && (!Number.isFinite(job.duration) || job.duration < 0 || job.duration > MAX_DURATION)) {
 		throw new PermanentError(localizedText(job.locale, 'tooLong'));
@@ -48,6 +51,11 @@ async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: str
 	setStage('quota.reserve');
 	const inferenceDay = new Date();
 	if (!await reserveInference(env, job, inferenceDay)) throw new PermanentError(localizedText(job.locale, 'dailyLimit'));
+	if (geminiTest) {
+		setStage('gemini.inference');
+		const text = await transcribeWithGemini(env.GEMINI_API_KEY!, audio, job);
+		return text || localizedText(job.locale, 'noSpeech');
+	}
 	setStage('whisper.inference');
 	const uzbekTest = env.WHISPER_UZBEK_TEST === 'true';
 	if (uzbekTest) console.info('Whisper Uzbek experiment enabled', { jobId: job.id, language: 'uz', beamSize: 8 });
@@ -126,7 +134,7 @@ export async function consume(batch: MessageBatch<Job>, env: BotEnv) {
 		} catch (error) {
 			console.error('Transcription job failed', {
 				jobId: job.id, attempt: message.attempts, queue: batch.queue, stage,
-				...safeError(error, [env.BOT_TOKEN, env.WEBHOOK_SECRET]),
+				...safeError(error, [env.BOT_TOKEN, env.WEBHOOK_SECRET, env.GEMINI_API_KEY ?? '']),
 			});
 			if (error instanceof GrammyError && [400, 403].includes(error.error_code)) {
 				await env.DB.prepare("UPDATE jobs SET status = 'failed', transcript = NULL WHERE id = ?1").bind(job.id).run();
