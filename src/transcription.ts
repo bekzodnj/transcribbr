@@ -57,20 +57,13 @@ async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: str
 		return text || localizedText(job.locale, 'noSpeech');
 	}
 	setStage('whisper.inference');
-	const uzbekTest = env.WHISPER_UZBEK_TEST === 'true';
-	if (uzbekTest) console.info('Whisper Uzbek experiment enabled', { jobId: job.id, language: 'uz', beamSize: 8 });
 	const result = await env.AI.run('@cf/openai/whisper-large-v3-turbo', {
 		// Use the documented JSON-compatible input. An ArrayBuffer nested in an
 		// object does not serialize to audio bytes when sent to the inference API.
 		audio,
 		task: 'transcribe', vad_filter: true, condition_on_previous_text: false,
-		...(uzbekTest ? {
-			language: 'uz',
-			// A short context/spelling sample, not an instruction-following prompt.
-			// Keep this modest: examples can bias Whisper toward unspoken words.
-			initial_prompt: 'Özbek tilidagi kundalik suhbat, lotin yozuvida. Assalomu alaykum, yaxshimisiz? Bugun ishlar qanday? Rahmat, yaxshi, böladi. Özbekiston.',
-			beam_size: 8,
-		} : job.audioLanguage === 'en' || job.audioLanguage === 'uz' ? { language: job.audioLanguage } : {}),
+		// Like Gemini, honor the recording language; omit the hint for Automatic.
+		...(job.audioLanguage === 'en' || job.audioLanguage === 'uz' ? { language: job.audioLanguage } : {}),
 	});
 	setStage('whisper.response');
 	if (typeof result?.text !== 'string') throw new Error('Whisper response did not contain a text field');

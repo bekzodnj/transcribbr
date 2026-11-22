@@ -20,7 +20,7 @@ const job: Job = { id: 1, userId: 2, chatId: 2, messageId: 3, fileId: 'voice-fil
 const db = (env as unknown as BotEnv).DB;
 const send = vi.fn().mockResolvedValue(undefined);
 const run = vi.fn().mockResolvedValue({ text: 'Salom! Hello!', transcription_info: { duration: 2 } });
-const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret', WHISPER_UZBEK_TEST: 'false', GEMINI_TRANSCRIBE_TEST: 'false',
+const bindings = { ...env, DB: db, BOT_TOKEN: '123:test', WEBHOOK_SECRET: 'test-secret', GEMINI_TRANSCRIBE_TEST: 'false',
 	TRANSCRIPTIONS: { send }, AI: { run } } as unknown as BotEnv;
 
 function batch(queue = 'transcribbr-transcriptions') {
@@ -467,7 +467,7 @@ describe('friendly onboarding and language preferences', () => {
 		expect(run).toHaveBeenCalledWith('@cf/openai/whisper-large-v3-turbo', expect.objectContaining({ language: 'en', task: 'transcribe' }));
 		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'noSpeech'));
 	});
-	it('temporarily forces Uzbek with a prompt and beam size without changing saved preferences', async () => {
+	it('honors the Whisper recording language without an Uzbek override or changing saved preferences', async () => {
 		await preferenceStore(db).setAudioLanguage(2, 'en');
 		vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
 		vi.spyOn(Api.prototype, 'getFile').mockResolvedValue({ file_id: 'v', file_unique_id: 'u', file_path: 'voice/note.oga' });
@@ -475,11 +475,12 @@ describe('friendly onboarding and language preferences', () => {
 		const delivery = batch();
 		delivery.messages[0].body = { ...job, audioLanguage: 'en' };
 		await submitJob(bindings, delivery.messages[0].body);
-		await consume(delivery, { ...bindings, WHISPER_UZBEK_TEST: 'true' });
+		await consume(delivery, bindings);
 		expect(run).toHaveBeenCalledWith('@cf/openai/whisper-large-v3-turbo', expect.objectContaining({
-			language: 'uz', task: 'transcribe', beam_size: 8,
-			initial_prompt: expect.stringContaining('Özbek tilidagi'),
+			language: 'en', task: 'transcribe',
 		}));
+		expect(run.mock.calls[0][1]).not.toHaveProperty('initial_prompt');
+		expect(run.mock.calls[0][1]).not.toHaveProperty('beam_size');
 		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'en', audioLanguage: 'en' });
 	});
 	it('localizes shared-quota messages for queued jobs', async () => {
