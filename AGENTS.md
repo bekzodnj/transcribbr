@@ -1,3 +1,8 @@
+# Project preferences
+
+- Do not add new tests for simple, straightforward changes (such as copy, spelling, or cosmetic tweaks) unless they have meaningful behavioral impact or regression risk.
+- Update existing test expectations when needed. Keep testing effort proportional to the change.
+
 # Cloudflare Workers
 
 STOP. Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any Workers, KV, R2, D1, Durable Objects, Queues, Vectorize, AI, or Agents SDK task.

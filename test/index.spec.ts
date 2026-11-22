@@ -5,6 +5,7 @@ import migration from '../migrations/0001_jobs.sql?raw';
 import quotaMigration from '../migrations/0002_global_usage.sql?raw';
 import preferencesMigration from '../migrations/0003_user_preferences.sql?raw';
 import worker from '../src/index';
+import { createBot } from '../src/bot';
 import { getAudio, splitTranscript } from '../src/audio';
 import { submitJob } from '../src/jobs';
 import { consume } from '../src/transcription';
@@ -31,6 +32,9 @@ beforeAll(async () => {
 	for (const sql of (migration + quotaMigration + preferencesMigration).split(';').filter((sql) => sql.trim())) await db.prepare(sql).run();
 });
 beforeEach(async () => {
+	vi.spyOn(Api.prototype, 'sendChatAction').mockResolvedValue(true);
+	vi.spyOn(Api.prototype, 'setMyCommands').mockResolvedValue(true);
+	vi.spyOn(Api.prototype, 'setChatMenuButton').mockResolvedValue(true);
 	await db.prepare('DELETE FROM jobs').run();
 	await db.prepare('DELETE FROM daily_ai_usage').run();
 	await db.prepare('DELETE FROM user_preferences').run();
@@ -57,10 +61,12 @@ describe('webhook', () => {
 		const response = await worker.fetch(request.clone(), bindings);
 		expect(response.status).toBe(200);
 		expect(send).toHaveBeenCalledWith({ ...job, duration: 2, locale: 'en', audioLanguage: 'auto' });
-		expect(reply).toHaveBeenCalledWith(job.chatId, text('en', 'received'), expect.anything(), undefined);
+		expect(reply).toHaveBeenCalledWith(job.chatId, text('en', 'received'), expect.objectContaining({
+			reply_markup: { remove_keyboard: true },
+		}), undefined);
 		expect(run).not.toHaveBeenCalled();
 		await worker.fetch(request.clone(), bindings);
-		expect(reply).toHaveBeenCalledTimes(1);
+		expect(reply).toHaveBeenCalledTimes(1); // A webhook retry must not duplicate the acknowledgment.
 	});
 	it('has a health endpoint and rejects unauthenticated updates', async () => {
 		expect((await worker.fetch(new Request('https://bot/health'), bindings)).status).toBe(200);
@@ -125,6 +131,8 @@ describe('consumer', () => {
 		await consume(batch(), bindings);
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(reply).toHaveBeenCalledTimes(1);
+		expect(Api.prototype.sendChatAction).not.toHaveBeenCalled();
+		expect(reply.mock.calls[0][2]).toMatchObject({ reply_markup: { remove_keyboard: true } });
 	});
 	it('retries delivery without retranscribing', async () => {
 		const reply = mockTelegram();
@@ -136,6 +144,7 @@ describe('consumer', () => {
 		await consume(batch(), bindings);
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(reply).toHaveBeenCalledTimes(2);
+		expect(Api.prototype.sendChatAction).not.toHaveBeenCalled();
 		expect(await db.prepare('SELECT inference_calls FROM daily_ai_usage').first('inference_calls')).toBe(1);
 	});
 	it('uses Gemini when enabled and retries delivery without another inference', async () => {
@@ -327,20 +336,69 @@ describe('friendly onboarding and language preferences', () => {
 		}), bindings);
 		expect(response.status).toBe(200);
 	}
+	it('loads preferences once per update, without caching them across updates', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		const get = vi.fn().mockResolvedValueOnce({ locale: 'en', audioLanguage: 'auto' })
+			.mockResolvedValueOnce({ locale: 'uz', audioLanguage: 'en' });
+		const bot = createBot('123:test', bindings.BOT_INFO, undefined, { get, setLocale: vi.fn(), setAudioLanguage: vi.fn() });
+		for (const updateId of [1, 2]) {
+			await bot.handleUpdate({ update_id: updateId, message: {
+				message_id: updateId, date: 1, chat: { id: 2, type: 'private', first_name: 'Test' },
+				from: { id: 2, is_bot: false, first_name: 'Test' }, text: '/help',
+				entities: [{ type: 'bot_command', offset: 0, length: 5 }],
+			} });
+			expect(get).toHaveBeenCalledTimes(updateId);
+		}
+		expect(reply.mock.calls.map((call) => call[1])).toEqual([text('en', 'ready'), text('uz', 'ready')]);
+	});
+	it('supports native targeted commands and the original recording-language alias', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		await sendText(`/privacy@${bindings.BOT_INFO.username}`);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'privacy'));
+		await sendText('/audio_language', 11);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'chooseAudio'));
+	});
+	it('keeps old language commands as aliases while advertising the clearer names', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		for (const [index, command] of ['ui_lang', 'language', 'input_lang', 'audio_language'].entries()) {
+			await sendText(`/${command}`, index + 20);
+			expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', index < 2 ? 'chooseLanguage' : 'chooseAudio'));
+		}
+		for (const locale of ['en', 'uz'] as const) {
+			expect(text(locale, 'ready')).toContain('/menu_lang');
+			expect(text(locale, 'ready')).toContain('/audio_lang');
+			expect(text(locale, 'noSpeech')).toContain('/audio_lang');
+			expect(text(locale, 'ready')).not.toMatch(/\/(ui_lang|input_lang)\b/);
+		}
+	});
+	it('explains duration limits separately from file-size limits', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		const response = await worker.fetch(new Request('https://bot/webhook', {
+			method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': 'test-secret' },
+			body: JSON.stringify({ update_id: 1, message: {
+				message_id: 3, date: 1, chat: { id: 2, type: 'private', first_name: 'Test' },
+				from: { id: 2, is_bot: false, first_name: 'Test' },
+				voice: { file_id: 'voice-file', file_unique_id: 'unique', duration: 601, file_size: 100 },
+			} }),
+		}), bindings);
+		expect(response.status).toBe(200);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'tooLong'));
+		expect(send).not.toHaveBeenCalled();
+	});
 	it('welcomes users with a built-in reply keyboard', async () => {
 		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
 		await sendText('/start');
 		expect(reply.mock.calls[0][1]).toBe(text('en', 'welcome'));
 		expect(reply.mock.calls[0][2]).toMatchObject({
-			reply_markup: { keyboard: [[{ text: '🇺🇿 O‘zbekcha' }, { text: '🇬🇧 English' }]], resize_keyboard: true },
+			reply_markup: { keyboard: [[{ text: '🇺🇿 Özbekcha' }, { text: '🇬🇧 English' }], [{ text: text('en', 'menuBack') }]], resize_keyboard: true },
 		});
 		expect(send).not.toHaveBeenCalled();
 	});
 	it('persists UI language independently from recording language across webhook invocations', async () => {
 		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
-		await sendText('🇺🇿 O‘zbekcha');
+		await sendText('🇺🇿 Özbekcha');
 		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'auto' });
-		expect(reply.mock.calls.map((call) => call[1])).toEqual([text('uz', 'ready'), text('uz', 'chooseAudio')]);
+		expect(reply.mock.calls.map((call) => call[1])).toEqual([text('uz', 'uiSaved')]);
 		await sendText('🎙 Inglizcha', 11);
 		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'en' });
 		await sendText('/language', 12);
@@ -349,11 +407,50 @@ describe('friendly onboarding and language preferences', () => {
 		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'auto' });
 		expect(await preferenceStore(db).get(99)).toEqual({ locale: 'en', audioLanguage: 'auto' });
 	});
+	it('exposes independent language commands, persistent settings buttons and a back button', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		await sendText('/settings');
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'settings'));
+		const options = reply.mock.calls.at(-1)?.[2];
+		expect(options).toMatchObject({ reply_markup: { keyboard: [[{ text: text('en', 'menuUi') }], [{ text: text('en', 'menuInput') }]], resize_keyboard: true } });
+		expect(options).not.toMatchObject({ reply_markup: { one_time_keyboard: true } });
+		expect(Api.prototype.setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
+			expect.objectContaining({ command: 'menu_lang' }), expect.objectContaining({ command: 'audio_lang' }),
+		]), { scope: { type: 'chat', chat_id: 2 } });
+		await sendText('/menu_lang', 11);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'chooseLanguage'));
+		await sendText('/audio_lang', 12);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'chooseAudio'));
+		await sendText(text('en', 'menuBack'), 13);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'settings'));
+		await sendText(text('en', 'menuUi'), 14);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'chooseLanguage'));
+		await sendText(text('en', 'menuInput'), 15);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('en', 'chooseAudio'));
+		expect(send).not.toHaveBeenCalled();
+	});
+	it('changing interface language preserves the previously chosen recording language and localizes menus', async () => {
+		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
+		await preferenceStore(db).setAudioLanguage(2, 'en');
+		await sendText('🇺🇿 Özbekcha');
+		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'en' });
+		expect(reply.mock.calls.at(-1)?.[2]).toMatchObject({ reply_markup: { remove_keyboard: true } });
+		await sendText('/audio_lang', 11);
+		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'chooseAudio'));
+		expect(reply.mock.calls.at(-1)?.[2]).toMatchObject({ reply_markup: { keyboard: [
+			[{ text: '🌐 Avtomatik' }], [{ text: '🎙 Özbekcha' }, { text: '🎙 Inglizcha' }], [{ text: text('uz', 'menuBack') }],
+		] } });
+		await sendText('🌐 Avtomatik', 12);
+		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'uz', audioLanguage: 'auto' });
+	});
 	it('shows helpful, localized instructions and privacy details', async () => {
 		const reply = vi.spyOn(Api.prototype, 'sendMessage').mockResolvedValue({ message_id: 9 } as TelegramMessage.TextMessage);
 		await preferenceStore(db).setLocale(2, 'uz');
 		await sendText('hello');
 		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'unsupported'));
+		expect(reply.mock.calls.at(-1)?.[2]).toMatchObject({ reply_markup: { keyboard: [
+			[{ text: text('uz', 'menuUi') }], [{ text: text('uz', 'menuInput') }],
+		] } });
 		await sendText('/privacy', 11);
 		expect(reply.mock.calls.at(-1)?.[1]).toBe(text('uz', 'privacy'));
 	});
@@ -381,7 +478,7 @@ describe('friendly onboarding and language preferences', () => {
 		await consume(delivery, { ...bindings, WHISPER_UZBEK_TEST: 'true' });
 		expect(run).toHaveBeenCalledWith('@cf/openai/whisper-large-v3-turbo', expect.objectContaining({
 			language: 'uz', task: 'transcribe', beam_size: 8,
-			initial_prompt: expect.stringContaining("O'zbek tilidagi"),
+			initial_prompt: expect.stringContaining('Özbek tilidagi'),
 		}));
 		expect(await preferenceStore(db).get(2)).toEqual({ locale: 'en', audioLanguage: 'en' });
 	});

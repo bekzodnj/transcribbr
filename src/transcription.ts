@@ -68,7 +68,7 @@ async function transcribe(env: BotEnv, api: Api, job: Job, setStage: (stage: str
 			language: 'uz',
 			// A short context/spelling sample, not an instruction-following prompt.
 			// Keep this modest: examples can bias Whisper toward unspoken words.
-			initial_prompt: "O'zbek tilidagi kundalik suhbat, lotin yozuvida. Assalomu alaykum, yaxshimisiz? Bugun ishlar qanday? Rahmat, yaxshi, bo'ladi. O'zbekiston.",
+			initial_prompt: 'Özbek tilidagi kundalik suhbat, lotin yozuvida. Assalomu alaykum, yaxshimisiz? Bugun ishlar qanday? Rahmat, yaxshi, böladi. Özbekiston.',
 			beam_size: 8,
 		} : job.audioLanguage === 'en' || job.audioLanguage === 'uz' ? { language: job.audioLanguage } : {}),
 	});
@@ -120,6 +120,7 @@ export async function consume(batch: MessageBatch<Job>, env: BotEnv) {
 					stage = 'telegram.sendMessage';
 					await api.sendMessage(job.chatId, chunks[i], {
 						reply_parameters: { message_id: job.messageId, allow_sending_without_reply: true },
+						reply_markup: { remove_keyboard: true },
 					});
 					stage = 'db.saveDelivery';
 					await env.DB.prepare('UPDATE jobs SET next_chunk = ?1 WHERE id = ?2').bind(i + 1, job.id).run();
