@@ -21,7 +21,8 @@ export async function transcribeWithGemini(apiKey: string, audio: string, job: J
 			generation_config: {
 				transcription_config: {
 					mode: { type: 'verbatim' },
-					language_codes: job.audioLanguage === 'uz' ? ['uz-UZ'] : job.audioLanguage === 'en' ? ['en-US'] : [],
+					language_codes: job.audioLanguage && job.audioLanguage !== 'auto'
+						? [{ en: 'en-US', uz: 'uz-UZ', ru: 'ru-RU' }[job.audioLanguage]] : [],
 				},
 			},
 		}),

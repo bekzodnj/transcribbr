@@ -1,5 +1,6 @@
 import type { BotEnv, Job } from './types';
-import { DAILY_LIMIT_MESSAGE, hasDailyCapacity } from './quota';
+import { isAdmin } from './admin';
+import { DAILY_LIMIT_MESSAGE, hasDailyCapacity, hasUserCapacity, reserveUserTranscription, USER_LIMIT_MESSAGE } from './quota';
 
 export async function submitJob(env: BotEnv, job: Job): Promise<boolean | string> {
 	const now = Date.now();
@@ -9,8 +10,10 @@ export async function submitJob(env: BotEnv, job: Job): Promise<boolean | string
 		return 'duplicate';
 	}
 	// Early rejection avoids downloading/enqueueing when already exhausted. The
-	// consumer repeats the check atomically, so this read is not the spending gate.
+	// consumer repeats the global check atomically, so this read is not the spending gate.
 	if (!await hasDailyCapacity(env, job)) return DAILY_LIMIT_MESSAGE;
+	const admin = isAdmin(env, job.userId);
+	if (!admin && !await hasUserCapacity(env, job, new Date(now))) return USER_LIMIT_MESSAGE;
 	// Single conditional insert serializes quota checks, including simultaneous requests.
 	const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO jobs (id, user_id, created_at)
 		SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM jobs WHERE user_id = ?2 AND created_at > ?4) < 5
@@ -18,6 +21,13 @@ export async function submitJob(env: BotEnv, job: Job): Promise<boolean | string
 		.bind(job.id, job.userId, now, now - 60_000).run();
 	const row = await env.DB.prepare('SELECT status FROM jobs WHERE id = ?1').bind(job.id).first<{ status: string }>();
 	if (!row) return false;
+	if (inserted.meta.changes && !admin) {
+		// Charge the per-user monthly allowance atomically; roll back the job if exhausted.
+		if (!await reserveUserTranscription(env, job, new Date(now))) {
+			await env.DB.prepare('DELETE FROM jobs WHERE id = ?1').bind(job.id).run();
+			return USER_LIMIT_MESSAGE;
+		}
+	}
 	// Resending a queued job repairs the insert/send gap if a webhook attempt failed.
 	if (row.status === 'queued') await env.TRANSCRIPTIONS.send(job);
 	return inserted.meta.changes ? true : 'duplicate';
